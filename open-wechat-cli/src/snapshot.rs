@@ -11,11 +11,11 @@ use std::path::PathBuf;
 pub fn run(
     args: SnapshotArgs,
     _cli: &Cli,
-    _config: &Config,
+    config: &Config,
     state: &State,
 ) -> Result<(String, Value, String)> {
     crate::host::require_local_data()?;
-    let account_dir = crate::host::data_root(_config);
+    let account_dir = crate::host::data_root(config);
     let source = PathBuf::from(account_dir).join(&args.account);
     let out = if args.out.is_absolute() {
         args.out

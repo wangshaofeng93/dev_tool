@@ -1,11 +1,16 @@
 use crate::cache;
-use crate::cli::{Cli, ListArgs};
+use crate::cli::{Cli, ListArgs, Order};
 use crate::config::Config;
 use crate::output::{OwcError, Result};
-use crate::schema::{self, SchemaMap, TableMapping};
+use crate::schema::{self, TableMapping};
 use crate::state::State;
+use crate::timezone::Timezone;
 use base64::Engine;
-use rusqlite::{types::ValueRef, Connection};
+use rusqlite::{
+    params_from_iter,
+    types::{Value as SqlValue, ValueRef},
+    Connection,
+};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +27,17 @@ pub struct Message {
     pub type_label: String,
     pub text: String,
     pub extra: crate::codec::DecodedContent,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageQuery {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub conv_id: Option<String>,
+    pub order: Option<Order>,
+    pub cursor: Option<(i64, String)>,
+    pub limit: Option<usize>,
+    pub timezone: Timezone,
 }
 
 impl Message {
@@ -50,6 +66,9 @@ impl Message {
             }
             if let Some(quote) = &self.extra.quote {
                 object.insert("quote".to_owned(), json!(quote));
+            }
+            if let Some(recalled) = &self.extra.recalled {
+                object.insert("recalled".to_owned(), json!(recalled));
             }
         }
         value
@@ -88,10 +107,11 @@ fn list_entities(
     let connection = open_directory(&dir, contacts)?;
     let schema_map = schema::introspect(&connection)?;
     let mapping = if contacts {
-        schema_map.contact
+        schema_map.contact.as_ref()
     } else {
-        schema_map.session
+        schema_map.session.as_ref()
     }
+    .cloned()
     .ok_or_else(|| {
         OwcError::data(if contacts {
             "Could not identify a contacts table."
@@ -101,14 +121,13 @@ fn list_entities(
     })?;
     let mut rows = select_rows(&connection, &mapping)?;
     if args.with_counts && !contacts {
-        let message_mapping = schema::introspect(&connection)?.message;
-        if let Some(message_mapping) = message_mapping {
-            if let Some(message_conv) = message_mapping.conv {
+        if let Some(message_mapping) = schema_map.message.as_ref() {
+            if let Some(message_conv) = message_mapping.conv.as_deref() {
                 let sql = format!(
                     "SELECT {}, COUNT(*) FROM {} GROUP BY {}",
-                    quote_id(&message_conv),
+                    quote_id(message_conv),
                     quote_id(&message_mapping.table),
-                    quote_id(&message_conv)
+                    quote_id(message_conv)
                 );
                 let mut statement = connection
                     .prepare(&sql)
@@ -136,7 +155,7 @@ fn list_entities(
     let needle = args.query.unwrap_or_default().to_lowercase();
     let mut rows: Vec<Value> = rows
         .into_iter()
-        .filter(|value| needle.is_empty() || value.to_string().to_lowercase().contains(&needle))
+        .filter(|value| entity_matches_query(value, &needle))
         .collect();
     let offset = decode_offset(args.cursor.as_deref())?;
     let total = rows.len();
@@ -157,17 +176,51 @@ fn list_entities(
     ))
 }
 
+fn entity_matches_query(value: &Value, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.iter().any(|(key, value)| {
+        matches!(
+            key.to_lowercase().as_str(),
+            "name" | "alias" | "remark" | "nickname"
+        ) && value
+            .as_str()
+            .is_some_and(|candidate| candidate.to_lowercase().contains(needle))
+    })
+}
+
 fn select_rows(connection: &Connection, mapping: &TableMapping) -> Result<Vec<Value>> {
     let columns = table_columns(connection, &mapping.table)?;
     let id = mapping
         .id
         .as_deref()
         .or_else(|| columns.first().map(String::as_str));
-    let name = mapping
-        .conv_name
-        .as_deref()
-        .or(mapping.alias.as_deref())
-        .or_else(|| columns.get(1).map(String::as_str));
+    let name = [
+        "conv_name",
+        "conversation_name",
+        "chat_name",
+        "name",
+        "display_name",
+        "nickname",
+        "alias",
+        "remark",
+        "real_name",
+        "contact_name",
+    ]
+    .iter()
+    .find_map(|candidate| {
+        columns
+            .iter()
+            .find(|column| column.eq_ignore_ascii_case(candidate))
+            .map(String::as_str)
+    })
+    .or(mapping.conv_name.as_deref())
+    .or(mapping.alias.as_deref())
+    .or_else(|| columns.get(1).map(String::as_str));
     let Some(id) = id else {
         return Ok(Vec::new());
     };
@@ -218,27 +271,249 @@ fn select_rows(connection: &Connection, mapping: &TableMapping) -> Result<Vec<Va
         .map_err(|error| OwcError::data(error.to_string()))
 }
 
-pub fn read_messages(
-    dir: &Path,
-    since: Option<i64>,
-    until: Option<i64>,
-) -> Result<(Vec<Message>, SchemaMap)> {
+pub fn read_messages(dir: &Path, query: &MessageQuery) -> Result<Vec<Message>> {
     let connection = open_directory(dir, false)?;
     let map = schema::introspect(&connection)?;
     let mapping = map
         .message
         .as_ref()
         .ok_or_else(|| OwcError::data("Could not identify a messages table."))?;
-    let messages = query_message_rows(&connection, mapping, since, until)?;
-    Ok((messages, map))
+    query_message_rows(&connection, mapping, query)
+}
+
+pub fn scan_messages<F>(
+    dir: &Path,
+    query: &MessageQuery,
+    batch_limit: usize,
+    result_limit: usize,
+    mut matches: F,
+) -> Result<(Vec<Message>, usize)>
+where
+    F: FnMut(&Message) -> bool,
+{
+    if batch_limit == 0 {
+        return Err(OwcError::usage("Message scan batch size must be positive."));
+    }
+    let connection = open_directory(dir, false)?;
+    let map = schema::introspect(&connection)?;
+    let mapping = map
+        .message
+        .as_ref()
+        .ok_or_else(|| OwcError::data("Could not identify a messages table."))?;
+    let mut output = Vec::new();
+    let mut total = 0usize;
+    let mut cursor = query.cursor.clone();
+    loop {
+        let mut batch_query = query.clone();
+        batch_query.cursor = cursor.clone();
+        batch_query.limit = Some(batch_limit);
+        let batch = query_message_rows(&connection, mapping, &batch_query)?;
+        let batch_len = batch.len();
+        let next_cursor = batch
+            .last()
+            .map(|message| (message.send_time_epoch, message.message_id.clone()));
+        for message in batch {
+            if matches(&message) {
+                total += 1;
+                if output.len() < result_limit {
+                    output.push(message);
+                }
+            }
+        }
+        if batch_len < batch_limit {
+            break;
+        }
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok((output, total))
+}
+
+pub fn resolve_conversation(
+    dir: &Path,
+    since: Option<i64>,
+    until: Option<i64>,
+    needle: &str,
+) -> Result<Option<String>> {
+    let connection = open_directory(dir, false)?;
+    let map = schema::introspect(&connection)?;
+    let mapping = map
+        .message
+        .as_ref()
+        .ok_or_else(|| OwcError::data("Could not identify a messages table."))?;
+    let expressions = message_expressions(&connection, mapping)?;
+    let Some(conv_column) = expressions[1].as_deref() else {
+        return Ok(None);
+    };
+    let Some(time_column) = expressions[5].as_deref() else {
+        return Err(OwcError::data("Message table is missing a time column."));
+    };
+    let time_expression = sql_time_expr(time_column);
+    let query = MessageQuery {
+        since,
+        until,
+        conv_id: None,
+        order: None,
+        cursor: None,
+        limit: None,
+        timezone: Timezone::Local,
+    };
+    let (where_clause, values) = filter_values(mapping, &expressions, &query, &time_expression);
+    let name_expression = expressions[2]
+        .as_deref()
+        .map(quote_id)
+        .unwrap_or_else(|| "NULL".to_owned());
+    let sql = format!(
+        "SELECT {}, {}, MAX({time_expression}) FROM {}{where_clause} GROUP BY {}, {}",
+        quote_id(conv_column),
+        name_expression,
+        quote_id(&mapping.table),
+        quote_id(conv_column),
+        name_expression
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            Ok((
+                value_from_ref(row.get_ref(0)?).to_string_value(),
+                value_from_ref(row.get_ref(1)?).to_string_value(),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
+        })
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    let needle_lower = needle.to_lowercase();
+    let mut selected: Option<(String, i64)> = None;
+    for row in rows {
+        let (conv_id, conv_name, last_activity) =
+            row.map_err(|error| OwcError::data(error.to_string()))?;
+        if conv_id == needle {
+            return Ok(Some(conv_id));
+        }
+        if conv_name.to_lowercase().contains(&needle_lower)
+            && selected
+                .as_ref()
+                .is_none_or(|(_, selected_activity)| last_activity > *selected_activity)
+        {
+            selected = Some((conv_id, last_activity));
+        }
+    }
+    Ok(selected.map(|(conv_id, _)| conv_id))
+}
+
+pub fn count_messages(dir: &Path, query: &MessageQuery) -> Result<usize> {
+    let connection = open_directory(dir, false)?;
+    let map = schema::introspect(&connection)?;
+    let mapping = map
+        .message
+        .as_ref()
+        .ok_or_else(|| OwcError::data("Could not identify a messages table."))?;
+    let expressions = message_expressions(&connection, mapping)?;
+    let time_column = expressions[5]
+        .as_deref()
+        .ok_or_else(|| OwcError::data("Message table is missing a time column."))?;
+    let time_expression = sql_time_expr(time_column);
+    let (where_clause, values) = filter_values(mapping, &expressions, query, &time_expression);
+    let sql = format!(
+        "SELECT COUNT(*) FROM {}{where_clause}",
+        quote_id(&mapping.table)
+    );
+    let count: i64 = connection
+        .query_row(&sql, params_from_iter(values.iter()), |row| row.get(0))
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    usize::try_from(count).map_err(|error| OwcError::data(error.to_string()))
 }
 
 fn query_message_rows(
     connection: &Connection,
     mapping: &TableMapping,
-    since: Option<i64>,
-    until: Option<i64>,
+    query: &MessageQuery,
 ) -> Result<Vec<Message>> {
+    let expressions = message_expressions(connection, mapping)?;
+    let required = expressions[5].is_some() && expressions[7].is_some();
+    if !required {
+        return Err(OwcError::data(
+            "Message table is missing time or content columns.",
+        ));
+    }
+    let time_expression = sql_time_expr(
+        expressions[5]
+            .as_deref()
+            .ok_or_else(|| OwcError::data("Message table is missing a time column."))?,
+    );
+    let (where_clause, mut values) = filter_values(mapping, &expressions, query, &time_expression);
+    let id_expression = expressions[0]
+        .as_deref()
+        .map(quote_id)
+        .map(|column| format!("CAST({column} AS TEXT)"))
+        .unwrap_or_else(|| "''".to_owned());
+    let order_clause = query
+        .order
+        .map(|order| {
+            let direction = if order == Order::Asc { "ASC" } else { "DESC" };
+            format!(" ORDER BY {time_expression} {direction}, {id_expression} {direction}")
+        })
+        .unwrap_or_default();
+    let limit_clause = if let Some(limit) = query.limit {
+        values.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        " LIMIT ?"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {} FROM {}{where_clause}{order_clause}{limit_clause}",
+        expressions
+            .iter()
+            .map(|expression| expression
+                .as_deref()
+                .map(quote_id)
+                .unwrap_or_else(|| "NULL".to_owned()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        quote_id(&mapping.table),
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            let time_value = value_from_ref(row.get_ref(5)?);
+            let epoch = parse_epoch(&time_value);
+            let raw_content_type = value_from_ref(row.get_ref(6)?);
+            let content_type = raw_content_type.as_i64().unwrap_or(0);
+            let raw = value_from_ref(row.get_ref(7)?)
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let decoded = crate::codec::decode_content(content_type, &raw);
+            Ok(Message {
+                message_id: value_from_ref(row.get_ref(0)?).to_string_value(),
+                conv_id: value_from_ref(row.get_ref(1)?).to_string_value(),
+                conv_name: value_from_ref(row.get_ref(2)?).to_string_value(),
+                sender_id: value_from_ref(row.get_ref(3)?).to_string_value(),
+                sender_name: value_from_ref(row.get_ref(4)?).to_string_value(),
+                send_time: crate::timezone::format_epoch(epoch, query.timezone),
+                send_time_epoch: epoch,
+                content_type,
+                type_label: decoded.type_label.clone(),
+                text: decoded.text.clone(),
+                extra: decoded,
+            })
+        })
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    let messages = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| OwcError::data(error.to_string()))?;
+    Ok(messages)
+}
+
+fn message_expressions(
+    connection: &Connection,
+    mapping: &TableMapping,
+) -> Result<[Option<String>; 8]> {
     let columns = table_columns(connection, &mapping.table)?;
     let pick = |column: Option<&str>, candidates: &[&str]| -> Option<String> {
         column.map(str::to_owned).or_else(|| {
@@ -250,7 +525,7 @@ fn query_message_rows(
             })
         })
     };
-    let expressions = [
+    Ok([
         pick(
             mapping.id.as_deref(),
             &["message_id", "msg_id", "id", "local_id"],
@@ -283,62 +558,60 @@ fn query_message_rows(
             mapping.content.as_deref(),
             &["content", "message_content", "body", "text"],
         ),
-    ];
-    let required = expressions[5].is_some() && expressions[7].is_some();
-    if !required {
-        return Err(OwcError::data(
-            "Message table is missing time or content columns.",
-        ));
+    ])
+}
+
+fn filter_values(
+    mapping: &TableMapping,
+    expressions: &[Option<String>; 8],
+    query: &MessageQuery,
+    time_expression: &str,
+) -> (String, Vec<SqlValue>) {
+    let mut predicates = Vec::new();
+    let mut values = Vec::new();
+    if let Some(since) = query.since {
+        predicates.push(format!("{time_expression} >= ?"));
+        values.push(SqlValue::Integer(since));
     }
-    let sql = format!(
-        "SELECT {} FROM {}",
-        expressions
-            .iter()
-            .map(|expression| expression
-                .as_deref()
-                .map(quote_id)
-                .unwrap_or_else(|| "NULL".to_owned()))
-            .collect::<Vec<_>>()
-            .join(", "),
-        quote_id(&mapping.table)
-    );
-    let mut statement = connection
-        .prepare(&sql)
-        .map_err(|error| OwcError::data(error.to_string()))?;
-    let rows = statement
-        .query_map([], |row| {
-            let time_value = value_from_ref(row.get_ref(5)?);
-            let epoch = parse_epoch(&time_value);
-            let raw_content_type = value_from_ref(row.get_ref(6)?);
-            let content_type = raw_content_type.as_i64().unwrap_or(0);
-            let raw = value_from_ref(row.get_ref(7)?)
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            let decoded = crate::codec::decode_content(content_type, &raw);
-            Ok(Message {
-                message_id: value_from_ref(row.get_ref(0)?).to_string_value(),
-                conv_id: value_from_ref(row.get_ref(1)?).to_string_value(),
-                conv_name: value_from_ref(row.get_ref(2)?).to_string_value(),
-                sender_id: value_from_ref(row.get_ref(3)?).to_string_value(),
-                sender_name: value_from_ref(row.get_ref(4)?).to_string_value(),
-                send_time: format_epoch(epoch),
-                send_time_epoch: epoch,
-                content_type,
-                type_label: decoded.type_label.clone(),
-                text: decoded.text.clone(),
-                extra: decoded,
-            })
-        })
-        .map_err(|error| OwcError::data(error.to_string()))?;
-    let mut messages = rows
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| OwcError::data(error.to_string()))?;
-    messages.retain(|message| {
-        since.is_none_or(|start| message.send_time_epoch >= start)
-            && until.is_none_or(|end| message.send_time_epoch <= end)
-    });
-    Ok(messages)
+    if let Some(until) = query.until {
+        predicates.push(format!("{time_expression} <= ?"));
+        values.push(SqlValue::Integer(until));
+    }
+    if let Some(conv_id) = query.conv_id.as_deref() {
+        if let Some(column) = expressions[1].as_deref().or(mapping.conv.as_deref()) {
+            predicates.push(format!("{} = ?", quote_id(column)));
+            values.push(SqlValue::Text(conv_id.to_owned()));
+        } else {
+            predicates.push("0".to_owned());
+        }
+    }
+    if let (Some((epoch, message_id)), Some(order)) = (query.cursor.as_ref(), query.order) {
+        let direction = if order == Order::Asc { ">" } else { "<" };
+        let id_expression = expressions[0]
+            .as_deref()
+            .map(quote_id)
+            .map(|column| format!("CAST({column} AS TEXT)"))
+            .unwrap_or_else(|| "''".to_owned());
+        predicates.push(format!(
+            "({time_expression} {direction} ? OR ({time_expression} = ? AND {id_expression} {direction} ?))"
+        ));
+        values.push(SqlValue::Integer(*epoch));
+        values.push(SqlValue::Integer(*epoch));
+        values.push(SqlValue::Text(message_id.clone()));
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+    (where_clause, values)
+}
+
+fn sql_time_expr(column: &str) -> String {
+    let column = quote_id(column);
+    format!(
+        "CASE WHEN typeof({column}) = 'text' AND {column} GLOB '????-??-??*' THEN COALESCE(CAST(strftime('%s', {column}) AS INTEGER), 0) WHEN typeof({column}) = 'text' THEN 0 WHEN ABS(CAST({column} AS INTEGER)) >= 1000000000000 THEN CAST({column} AS INTEGER) / 1000 ELSE CAST({column} AS INTEGER) END"
+    )
 }
 
 fn open_directory(dir: &Path, contacts: bool) -> Result<Connection> {
@@ -426,12 +699,6 @@ fn parse_epoch(value: &Value) -> i64 {
     } else {
         0
     }
-}
-
-fn format_epoch(epoch: i64) -> String {
-    chrono::DateTime::from_timestamp(epoch, 0)
-        .map(|date| date.format("%Y-%m-%dT%H:%M:%S").to_string())
-        .unwrap_or_default()
 }
 
 fn decode_offset(cursor: Option<&str>) -> Result<usize> {

@@ -7,10 +7,16 @@ use crate::output::{OwcError, Result};
 use crate::state::State;
 use crate::store::{self, Message};
 use base64::Engine;
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-use chrono_tz::Tz;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+
+#[derive(Default)]
+struct FetchOptions<'a> {
+    query: Option<&'a str>,
+    order: Option<Order>,
+    cursor: Option<&'a str>,
+    page_limit: Option<usize>,
+    per_conv_limit: Option<usize>,
+}
 
 pub fn messages(
     command: MessagesCommand,
@@ -31,8 +37,9 @@ pub fn history(
     config: &Config,
     state: &State,
 ) -> Result<(String, Value, String)> {
-    let since = parse_bound(args.since.as_deref(), &cli.tz, false)?;
-    let until = parse_bound(args.until.as_deref(), &cli.tz, true)?;
+    let timezone = crate::timezone::resolve(cli, config)?;
+    let since = crate::timezone::parse_bound(args.since.as_deref(), timezone, false)?;
+    let until = crate::timezone::parse_bound(args.until.as_deref(), timezone, true)?;
     crate::host::require_local_data()?;
     let account = selected_account(cli, config);
     let account = account.ok_or_else(|| OwcError::precondition("No account selected."))?;
@@ -70,7 +77,9 @@ fn stats(
     config: &Config,
     state: &State,
 ) -> Result<(String, Value, String)> {
-    let (messages, resolved) = fetch_messages(&args, None, None, None, cli, config, state)?;
+    let timezone = crate::timezone::resolve(cli, config)?;
+    let (messages, resolved, _) =
+        fetch_messages(&args, FetchOptions::default(), cli, config, state)?;
     let mut by_type = serde_json::Map::new();
     let mut senders = std::collections::HashSet::new();
     for message in &messages {
@@ -87,8 +96,8 @@ fn stats(
     let mut data = json!({
         "total": messages.len(),
         "senders": senders.len(),
-        "first_time": first.map(format_time),
-        "last_time": last.map(format_time),
+        "first_time": first.map(|epoch| crate::timezone::format_epoch(epoch, timezone)),
+        "last_time": last.map(|epoch| crate::timezone::format_epoch(epoch, timezone)),
         "by_type": by_type,
     });
     if let Some(conv) = resolved {
@@ -112,33 +121,24 @@ fn list(
     if args.limit == 0 {
         return Err(OwcError::usage("--limit must be greater than zero."));
     }
-    let (mut messages, resolved) = fetch_messages(
+    if args.limit_per_conv == Some(0) {
+        return Err(OwcError::usage(
+            "--limit-per-conv must be greater than zero.",
+        ));
+    }
+    let (messages, resolved, total) = fetch_messages(
         &args.filter,
-        args.query.as_deref(),
-        Some(args.order),
-        args.cursor.as_deref(),
+        FetchOptions {
+            query: args.query.as_deref(),
+            order: Some(args.order),
+            cursor: args.cursor.as_deref(),
+            page_limit: Some(args.limit),
+            per_conv_limit: args.limit_per_conv,
+        },
         cli,
         config,
         state,
     )?;
-    if let Some(per_conv) = args.limit_per_conv {
-        if per_conv == 0 {
-            return Err(OwcError::usage(
-                "--limit-per-conv must be greater than zero.",
-            ));
-        }
-        let mut counts = std::collections::HashMap::<String, usize>::new();
-        messages.retain(|message| {
-            let count = counts.entry(message.conv_id.clone()).or_default();
-            if *count >= per_conv {
-                false
-            } else {
-                *count += 1;
-                true
-            }
-        });
-    }
-    let total = messages.len();
     let page: Vec<Message> = messages.into_iter().take(args.limit).collect();
     let next_cursor = if page.len() == args.limit && total > page.len() {
         page.last().map(encode_cursor)
@@ -164,11 +164,15 @@ fn export(
     config: &Config,
     state: &State,
 ) -> Result<(String, Value, String)> {
-    let (mut messages, resolved) = fetch_messages(
+    let (mut messages, resolved, _) = fetch_messages(
         &args.list.filter,
-        args.list.query.as_deref(),
-        Some(args.list.order),
-        args.list.cursor.as_deref(),
+        FetchOptions {
+            query: args.list.query.as_deref(),
+            order: Some(args.list.order),
+            cursor: args.list.cursor.as_deref(),
+            page_limit: Some(args.list.limit),
+            per_conv_limit: args.list.limit_per_conv,
+        },
         cli,
         config,
         state,
@@ -213,15 +217,14 @@ fn export(
 
 fn fetch_messages(
     filter: &MessageFilterArgs,
-    query: Option<&str>,
-    order: Option<Order>,
-    cursor: Option<&str>,
+    options: FetchOptions<'_>,
     cli: &Cli,
     config: &Config,
     state: &State,
-) -> Result<(Vec<Message>, Option<String>)> {
-    let since = parse_bound(filter.since.as_deref(), &cli.tz, false)?;
-    let until = parse_bound(filter.until.as_deref(), &cli.tz, true)?;
+) -> Result<(Vec<Message>, Option<String>, usize)> {
+    let timezone = crate::timezone::resolve(cli, config)?;
+    let since = crate::timezone::parse_bound(filter.since.as_deref(), timezone, false)?;
+    let until = crate::timezone::parse_bound(filter.until.as_deref(), timezone, true)?;
     if let (Some(since), Some(until)) = (since, until) {
         if since > until {
             return Err(OwcError::usage("--since must not be later than --until."));
@@ -229,135 +232,99 @@ fn fetch_messages(
     }
     let account = selected_account(cli, config);
     let dir = cache::resolve_db_dir(filter.db_dir.as_deref(), account, state)?;
-    let (mut messages, schema_map) = store::read_messages(&dir, since, until)?;
-    let mut resolved = None;
-    if let Some(conv) = filter.conv.as_deref() {
-        if messages.iter().any(|message| message.conv_id == conv) {
-            messages.retain(|message| message.conv_id == conv);
-            resolved = Some(conv.to_owned());
-        } else {
-            let needle = conv.to_lowercase();
-            let matches: Vec<&Message> = messages
-                .iter()
-                .filter(|message| message.conv_name.to_lowercase().contains(&needle))
-                .collect();
-            let mut active = std::collections::HashMap::<String, i64>::new();
-            for message in &matches {
-                active
-                    .entry(message.conv_id.clone())
-                    .and_modify(|last| *last = (*last).max(message.send_time_epoch))
-                    .or_insert(message.send_time_epoch);
-            }
-            let selected = active
-                .into_iter()
-                .max_by_key(|entry| entry.1)
-                .map(|entry| entry.0);
-            if let Some(selected) = selected {
-                messages.retain(|message| message.conv_id == selected);
-                resolved = Some(selected);
-            } else {
-                messages.clear();
-            }
+    let resolved = filter
+        .conv
+        .as_deref()
+        .map(|needle| store::resolve_conversation(&dir, since, until, needle))
+        .transpose()?
+        .flatten();
+    if filter.conv.is_some() && resolved.is_none() {
+        return Ok((Vec::new(), None, 0));
+    }
+    let cursor_key = options
+        .cursor
+        .map(decode_cursor)
+        .transpose()?
+        .filter(|_| options.order.is_some());
+    let query_lower = options.query.unwrap_or_default().to_lowercase();
+    let Some(page_limit) = options.page_limit else {
+        let query = store::MessageQuery {
+            since,
+            until,
+            conv_id: resolved.clone(),
+            order: None,
+            cursor: None,
+            limit: None,
+            timezone,
+        };
+        let messages = store::read_messages(&dir, &query)?;
+        let messages = filter_text(messages, &query_lower);
+        let total = messages.len();
+        return Ok((messages, resolved, total));
+    };
+    let sql_limit = page_limit.saturating_add(1);
+    let mut query = store::MessageQuery {
+        since,
+        until,
+        conv_id: resolved.clone(),
+        order: options.order,
+        cursor: cursor_key,
+        limit: Some(sql_limit),
+        timezone,
+    };
+    if query_lower.is_empty() && options.per_conv_limit.is_none() {
+        let total = store::count_messages(&dir, &query)?;
+        let messages = store::read_messages(&dir, &query)?;
+        return Ok((messages, resolved, total));
+    }
+    query.order = Some(options.order.ok_or_else(|| {
+        OwcError::new(
+            crate::output::ErrorCode::Internal,
+            "Paged message queries require an order.",
+            "Report this unexpected query state.",
+        )
+    })?);
+    let mut conv_counts = std::collections::HashMap::<String, usize>::new();
+    let (messages, total) = store::scan_messages(&dir, &query, sql_limit, sql_limit, |message| {
+        if !query_matches(message, &query_lower) {
+            return false;
         }
-    }
-    let query_lower = query.unwrap_or_default().to_lowercase();
-    if !query_lower.is_empty() {
-        messages.retain(|message| {
-            let value = message.to_value().to_string().to_lowercase();
-            value.contains(&query_lower)
-        });
-    }
-    if let (Some(cursor), Some(order)) = (cursor, order) {
-        let (epoch, message_id) = decode_cursor(cursor)?;
-        messages.retain(|message| match order {
-            Order::Asc => {
-                (message.send_time_epoch, message.message_id.as_str())
-                    > (epoch, message_id.as_str())
+        if let Some(per_conv) = options.per_conv_limit {
+            let count = conv_counts.entry(message.conv_id.clone()).or_default();
+            if *count >= per_conv {
+                return false;
             }
-            Order::Desc => {
-                (message.send_time_epoch, message.message_id.as_str())
-                    < (epoch, message_id.as_str())
-            }
-        });
+            *count += 1;
+        }
+        true
+    })?;
+    Ok((messages, resolved, total))
+}
+
+fn filter_text(messages: Vec<Message>, query: &str) -> Vec<Message> {
+    if query.is_empty() {
+        messages
+    } else {
+        messages
+            .into_iter()
+            .filter(|message| query_matches(message, query))
+            .collect()
     }
-    if let Some(order) = order {
-        messages.sort_by(|left, right| {
-            let comparison = (left.send_time_epoch, &left.message_id)
-                .cmp(&(right.send_time_epoch, &right.message_id));
-            if order == Order::Asc {
-                comparison
-            } else {
-                comparison.reverse()
-            }
-        });
-    }
-    let _ = schema_map;
-    Ok((messages, resolved))
+}
+
+fn query_matches(message: &Message, query: &str) -> bool {
+    query.is_empty()
+        || message
+            .to_value()
+            .to_string()
+            .to_lowercase()
+            .contains(query)
 }
 
 fn selected_account<'a>(cli: &'a Cli, config: &'a Config) -> Option<&'a str> {
     cli.account
         .as_deref()
         .or_else(|| (!config.default_account.is_empty()).then_some(config.default_account.as_str()))
-}
-
-fn parse_bound(value: Option<&str>, timezone: &str, end_of_day: bool) -> Result<Option<i64>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let date_only = value.len() == 10;
-    let naive = if date_only {
-        NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .map_err(|_| {
-                OwcError::usage(format!(
-                    "Invalid time `{value}`; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS."
-                ))
-            })?
-            .and_hms_opt(
-                if end_of_day { 23 } else { 0 },
-                if end_of_day { 59 } else { 0 },
-                if end_of_day { 59 } else { 0 },
-            )
-            .ok_or_else(|| OwcError::usage(format!("Invalid time `{value}`.")))?
-    } else {
-        NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
-            .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
-            .map_err(|_| {
-                OwcError::usage(format!(
-                    "Invalid time `{value}`; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS."
-                ))
-            })?
-    };
-    let timestamp = if timezone == "local" {
-        Local
-            .from_local_datetime(&naive)
-            .single()
-            .or_else(|| Local.from_local_datetime(&naive).earliest())
-            .ok_or_else(|| {
-                OwcError::usage(format!("Time `{value}` is invalid in the local timezone."))
-            })?
-            .timestamp()
-    } else {
-        let tz: Tz = timezone
-            .parse()
-            .map_err(|_| OwcError::usage(format!("Unknown timezone `{timezone}`.")))?;
-        tz.from_local_datetime(&naive)
-            .single()
-            .or_else(|| tz.from_local_datetime(&naive).earliest())
-            .ok_or_else(|| {
-                OwcError::usage(format!(
-                    "Time `{value}` is invalid in timezone `{timezone}`."
-                ))
-            })?
-            .timestamp()
-    };
-    Ok(Some(timestamp))
-}
-
-fn format_time(epoch: i64) -> String {
-    chrono::DateTime::from_timestamp(epoch, 0)
-        .map(|date| date.format("%Y-%m-%dT%H:%M:%S").to_string())
-        .unwrap_or_default()
 }
 
 fn encode_cursor(message: &Message) -> String {
@@ -380,9 +347,4 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String)> {
         .parse::<i64>()
         .map_err(|_| OwcError::usage("Invalid message cursor."))?;
     Ok((epoch, id.to_owned()))
-}
-
-#[allow(dead_code)]
-fn _unused_path_example() -> Option<PathBuf> {
-    None
 }

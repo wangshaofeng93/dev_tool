@@ -107,7 +107,10 @@ owc history    [--conv] [--since] [--until] [--query] [--limit] [--cursor]
   **缺缓存则自动执行 key→snapshot→decrypt→query 全链路**。
 - `--conv` 既接受原始 `conv_id`（`R:...` 群 / `S:...` 单聊），也接受**群名/联系人姓名子串**，
   需自动解析匹配；多个匹配时取最近活跃者，并在 `data.resolved_conv` 回报解析结果。
-- 时间格式 `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM:SS`，按 `--tz` 解释；格式错误 → `USAGE`。
+- 时间格式 `YYYY-MM-DD` 或 `YYYY-MM-DDTHH:MM:SS`；按 `--tz`、配置 `tz`、默认
+  `local` 的优先级解释（`--tz` 优先级最高）；格式或时区错误 → `USAGE`。
+- `send_time`、`stats.first_time` 和 `stats.last_time` 都按同一有效时区格式化；
+  `send_time_epoch` 始终为 UTC epoch 秒。
 - `--query` 的匹配范围（S1）：正文 `text` + 链接 title/url + 附件文件名 + `media[].ocr` +
   合并转发子消息正文。
 - `--cursor`：不透明字符串，实现为 `base64url(send_time_epoch:message_id)`；
@@ -212,6 +215,9 @@ S2 事实：`AES-CBC`、`DEFAULT_PAGE_SIZE=4096`、`cipher`、`raw key`、页 1 
 `message_id` · `conv_id` · `conv_name` · `sender_id` · `sender_name` · `send_time` ·
 `send_time_epoch` · `content_type` · `type_label` · `text`
 
+`send_time` 为有效时区中的 `YYYY-MM-DDTHH:MM:SS`；统计时间 `first_time` / `last_time`
+使用同一时区格式，`send_time_epoch` 保持原始 UTC epoch 秒。
+
 扩展字段（按需出现）：
 - `media[]`：`kind`(`image|file|voice|video`) · `name` · `size` · `width` · `height` · `md5` ·
   `duration_s` · `local_path` · `exists` · `ocr`
@@ -272,6 +278,7 @@ footer 内 `open-wechat-cli` 标记）。
 5. **消息富内容的二进制/protobuf 布局**（`proto.rs`/`codec.rs`）：实现一个最小 protobuf
    wire 解析器 + XML/JSON 兜底，尽力提取 link/forward/quote/media，解析失败时
    **保留 `text` 为空并降级为 `other`，不得报错中断整次查询**。
+   recalled 字段名/别名同样是推测，需用真实设备消息验证。
 6. 快照的 WAL 处理细节与 `--verify` 的页校验强度。
 
 ## 12. 验证要求（Linux 上必须全绿）

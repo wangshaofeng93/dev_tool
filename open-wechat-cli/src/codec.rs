@@ -36,6 +36,12 @@ pub struct ForwardInfo {
     pub items: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RecalledInfo {
+    pub revoker_id: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodedContent {
     pub type_label: String,
@@ -48,6 +54,8 @@ pub struct DecodedContent {
     pub forward: Option<ForwardInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote: Option<QuoteInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recalled: Option<RecalledInfo>,
 }
 
 // S3: Numeric WXWork content_type values are not documented; familiar WeChat-style
@@ -86,6 +94,7 @@ pub fn decode_content(content_type: i64, raw: &str) -> DecodedContent {
         link: None,
         forward: None,
         quote: None,
+        recalled: None,
     };
     if label == "text" {
         decoded.text = raw.to_owned();
@@ -93,13 +102,21 @@ pub fn decode_content(content_type: i64, raw: &str) -> DecodedContent {
     }
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
         extract_json(&value, &mut decoded);
-        if !decoded.text.is_empty() || decoded.link.is_some() || !decoded.media.is_empty() {
+        if !decoded.text.is_empty()
+            || decoded.link.is_some()
+            || decoded.recalled.is_some()
+            || !decoded.media.is_empty()
+        {
             return decoded;
         }
     }
     if raw.contains('<') && raw.contains('>') {
         extract_xml(raw, &mut decoded);
-        if !decoded.text.is_empty() || decoded.link.is_some() || !decoded.media.is_empty() {
+        if !decoded.text.is_empty()
+            || decoded.link.is_some()
+            || decoded.recalled.is_some()
+            || !decoded.media.is_empty()
+        {
             return decoded;
         }
     }
@@ -133,6 +150,16 @@ fn extract_json(value: &Value, decoded: &mut DecodedContent) {
             .find_map(|key| object.get(*key).and_then(Value::as_str))
             .map(str::to_owned)
     };
+    let get_value = |source: &serde_json::Map<String, Value>, keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            source.get(*key).and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_i64().map(|number| number.to_string()))
+            })
+        })
+    };
     decoded.text = get(&["text", "content", "body"]).unwrap_or_default();
     let url = get(&["url", "link", "href"]);
     let title = get(&["title", "name"]);
@@ -144,6 +171,42 @@ fn extract_json(value: &Value, decoded: &mut DecodedContent) {
         decoded.quote = Some(QuoteInfo {
             sender_name: Some(sender_name),
             text: get(&["quote_text", "quoted_text"]),
+        });
+    }
+    // S3: Recall field aliases are inferred and require validation against real WXWork payloads.
+    let recalled_object = object.get("recalled").and_then(Value::as_object);
+    let revoker_keys = [
+        "revoker_id",
+        "revokerId",
+        "revoker",
+        "revoke_user_id",
+        "revokeUserId",
+    ];
+    let revoked_at_keys = [
+        "revoked_at",
+        "revokedAt",
+        "revoke_time",
+        "revokeTime",
+        "revoke_timestamp",
+        "revokeTimestamp",
+    ];
+    let revoker_id = get_value(object, &revoker_keys)
+        .or_else(|| recalled_object.and_then(|nested| get_value(nested, &revoker_keys)));
+    let revoked_at = get_value(object, &revoked_at_keys)
+        .or_else(|| recalled_object.and_then(|nested| get_value(nested, &revoked_at_keys)));
+    let recalled = object
+        .get("recalled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || recalled_object.is_some()
+        || object
+            .get("is_recalled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if recalled || revoker_id.is_some() || revoked_at.is_some() {
+        decoded.recalled = Some(RecalledInfo {
+            revoker_id,
+            revoked_at,
         });
     }
     if let Some(items) = object.get("items").and_then(Value::as_array) {
@@ -196,13 +259,41 @@ fn extract_xml(raw: &str, decoded: &mut DecodedContent) {
     let url = xml_tag(raw, &["url", "weburl", "link"]);
     let desc = xml_tag(raw, &["des", "desc", "description"]);
     let text = xml_tag(raw, &["content", "text"]);
+    // S3: Recall field aliases are inferred and require validation against real WXWork payloads.
+    let revoker_id = xml_tag(
+        raw,
+        &[
+            "revoker_id",
+            "revokerId",
+            "revoker",
+            "revoke_user_id",
+            "revokeUserId",
+        ],
+    );
+    let revoked_at = xml_tag(
+        raw,
+        &[
+            "revoked_at",
+            "revokedAt",
+            "revoke_time",
+            "revokeTime",
+            "revoke_timestamp",
+            "revokeTimestamp",
+        ],
+    );
     if let Some(text) = text.filter(|value| !value.is_empty()) {
         decoded.text = text;
     }
     if url.is_some() || title.is_some() || desc.is_some() {
         decoded.link = Some(LinkInfo { url, title, desc });
     }
-    if decoded.link.is_none() && decoded.text.is_empty() {
+    if revoker_id.is_some() || revoked_at.is_some() {
+        decoded.recalled = Some(RecalledInfo {
+            revoker_id,
+            revoked_at,
+        });
+    }
+    if decoded.link.is_none() && decoded.text.is_empty() && decoded.recalled.is_none() {
         decoded.type_label = "other".to_owned();
     }
 }

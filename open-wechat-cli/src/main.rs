@@ -20,6 +20,7 @@ mod state;
 mod store;
 #[cfg(test)]
 mod tests;
+mod timezone;
 
 use clap::Parser;
 use cli::{Cli, Command};

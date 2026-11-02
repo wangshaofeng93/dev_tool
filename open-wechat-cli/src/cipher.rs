@@ -84,10 +84,10 @@ pub fn decrypt_database(encrypted: &[u8], raw_key: &[u8]) -> Result<DecryptedDat
         plain.extend_from_slice(SQLITE_HEADER);
         let pages = encrypted.len() / PAGE_SIZE;
         for page_no in 1..=pages {
-            let (page_start, body_start) = if page_no == 1 {
-                (0, 16)
+            let page_start = if page_no == 1 {
+                0
             } else {
-                ((page_no - 1) * PAGE_SIZE, (page_no - 1) * PAGE_SIZE)
+                (page_no - 1) * PAGE_SIZE
             };
             let page_end = page_start + PAGE_SIZE;
             let page = if page_no == 1 {
@@ -111,7 +111,6 @@ pub fn decrypt_database(encrypted: &[u8], raw_key: &[u8]) -> Result<DecryptedDat
                 .map_err(|_| OwcError::data("Could not decrypt a database page."))?;
             plain.extend_from_slice(&body);
             plain.resize(plain.len() + profile.reserve(), 0);
-            let _ = body_start;
         }
         if plain.get(..16) != Some(SQLITE_HEADER.as_slice()) {
             return Err(OwcError::new(
@@ -236,7 +235,6 @@ pub(crate) fn encrypt_db(plain: &[u8], raw_key: &[u8], profile: CipherProfile) -
     for page_no in 1..=(plain.len() / PAGE_SIZE) {
         let page_start = (page_no - 1) * PAGE_SIZE;
         let off = if page_no == 1 { 16 } else { 0 };
-        let body_len = PAGE_SIZE - profile.reserve() - off;
         let body = &plain[page_start + off..page_start + PAGE_SIZE - profile.reserve()];
         let iv: Vec<u8> = (0..16)
             .map(|idx| (idx as u8).wrapping_add(page_no as u8).wrapping_mul(7))
@@ -271,7 +269,6 @@ pub(crate) fn encrypt_db(plain: &[u8], raw_key: &[u8], profile: CipherProfile) -
         encrypted.extend_from_slice(&iv);
         encrypted.extend_from_slice(&hmac);
         encrypted.resize(encrypted.len() + profile.reserve() - 16 - hmac.len(), 0);
-        let _ = body_len;
     }
     Ok(encrypted)
 }

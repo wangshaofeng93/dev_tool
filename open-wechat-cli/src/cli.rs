@@ -14,8 +14,8 @@ pub struct Cli {
     pub verbose: bool,
     #[arg(long, global = true)]
     pub account: Option<String>,
-    #[arg(long, global = true, default_value = "local")]
-    pub tz: String,
+    #[arg(long, global = true)]
+    pub tz: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -89,7 +89,10 @@ pub struct SnapshotArgs {
     pub out: PathBuf,
     #[arg(long, value_delimiter = ',')]
     pub dbs: Vec<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Disable WAL handling (not implemented in this reconstruction)"
+    )]
     pub no_wal: bool,
     #[arg(long)]
     pub reuse: bool,
@@ -175,15 +178,30 @@ pub struct MessageListArgs {
     pub order: Order,
     #[arg(long)]
     pub limit_per_conv: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Use the message index (not implemented in this reconstruction)"
+    )]
     pub index: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Include index status (not implemented in this reconstruction)"
+    )]
     pub with_index: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Set the search time budget (not implemented in this reconstruction)"
+    )]
     pub time_budget: Option<u64>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Limit indexed search hits (not implemented in this reconstruction)"
+    )]
     pub max_hits: Option<usize>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Set the index scan step (not implemented in this reconstruction)"
+    )]
     pub step: Option<usize>,
 }
 
@@ -221,13 +239,26 @@ pub struct HistoryArgs {
     pub cursor: Option<String>,
     #[arg(long, value_enum, default_value_t = Order::Desc)]
     pub order: Order,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Refresh the history cache (not implemented in this reconstruction)"
+    )]
     pub refresh: bool,
-    #[arg(long, default_value_t = 600)]
+    #[arg(
+        long,
+        default_value_t = 600,
+        help = "Set cache age (not implemented in this reconstruction)"
+    )]
     pub max_age: u64,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Use the message index (not implemented in this reconstruction)"
+    )]
     pub index: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Disable cache persistence (not implemented in this reconstruction)"
+    )]
     pub no_persist: bool,
 }
 

@@ -117,7 +117,7 @@ fn cli() -> Cli {
         json: true,
         verbose: false,
         account: None,
-        tz: "UTC".to_owned(),
+        tz: Some("UTC".to_owned()),
         command: crate::cli::Command::Doctor,
     }
 }
@@ -214,6 +214,29 @@ fn fixture_queries_and_export_formats_cover_cli_contract() {
         .expect("filtered messages list should query fixture");
     assert_eq!(data(searched)["items"].as_array().map(Vec::len), Some(2));
 
+    let mut conversation = list_args(dir.path());
+    conversation.filter.conv = Some("Engineering".to_owned());
+    conversation.limit = 2;
+    let conversation_page = crate::query::messages(
+        MessagesCommand::List(conversation.clone()),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("conversation-name resolution should query fixture");
+    let conversation_page = data(conversation_page);
+    assert_eq!(conversation_page["resolved_conv"], "R:team");
+    assert_eq!(conversation_page["items"].as_array().map(Vec::len), Some(2));
+    let cursor = conversation_page["next_cursor"]
+        .as_str()
+        .expect("conversation page should expose a cursor")
+        .to_owned();
+    conversation.cursor = Some(cursor);
+    let conversation_next =
+        crate::query::messages(MessagesCommand::List(conversation), &cli, &config, &state)
+            .expect("conversation cursor should apply in SQL");
+    assert_eq!(data(conversation_next)["items"][0]["message_id"], "m3");
+
     let mut descending = list_args(dir.path());
     descending.order = Order::Desc;
     descending.limit = 2;
@@ -292,9 +315,185 @@ fn fixture_queries_and_export_formats_cover_cli_contract() {
 }
 
 #[test]
+fn sql_time_filters_parse_text_timestamps() {
+    let (dir, db_path) = create_query_fixture();
+    let connection = Connection::open(db_path).expect("query fixture should open");
+    connection
+        .execute(
+            "UPDATE messages SET send_time = ?1 WHERE message_id = ?2",
+            ("2024-01-01 11:00:00", "m2"),
+        )
+        .expect("text timestamp should be stored");
+    drop(connection);
+
+    let mut args = list_args(dir.path());
+    args.filter.since = Some("2024-01-01T10:30:00".to_owned());
+    args.filter.until = Some("2024-01-01T11:30:00".to_owned());
+    let result = crate::query::messages(
+        MessagesCommand::List(args),
+        &cli(),
+        &Config::default(),
+        &state(dir.path()),
+    )
+    .expect("text timestamps should be queryable");
+    let result = data(result);
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["items"][0]["message_id"], "m2");
+    assert_eq!(result["items"][0]["send_time"], "2024-01-01T11:00:00");
+}
+
+#[test]
+fn entity_query_matches_only_display_name_fields() {
+    let (dir, _db_path) = create_query_fixture();
+    let state = state(dir.path());
+    let config = Config::default();
+    let cli = cli();
+
+    let contacts_by_id = crate::store::contacts(
+        ListArgs {
+            db_dir: Some(dir.path().to_path_buf()),
+            query: Some("u1".to_owned()),
+            limit: 10,
+            cursor: None,
+            with_counts: false,
+        },
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("contact query should succeed");
+    assert_eq!(
+        data(contacts_by_id)["items"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let sessions_by_activity = crate::store::sessions(
+        ListArgs {
+            db_dir: Some(dir.path().to_path_buf()),
+            query: Some("1704193200".to_owned()),
+            limit: 10,
+            cursor: None,
+            with_counts: false,
+        },
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("session query should succeed");
+    assert_eq!(
+        data(sessions_by_activity)["items"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let sessions_by_name = crate::store::sessions(
+        ListArgs {
+            db_dir: Some(dir.path().to_path_buf()),
+            query: Some("Engineering".to_owned()),
+            limit: 10,
+            cursor: None,
+            with_counts: false,
+        },
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("display-name query should succeed");
+    assert_eq!(
+        data(sessions_by_name)["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn message_and_stats_timestamps_follow_selected_timezone() {
+    let (dir, _db_path) = create_query_fixture();
+    let state = state(dir.path());
+    let mut config = Config::default();
+    let mut cli = cli();
+    cli.tz = Some("Asia/Shanghai".to_owned());
+
+    let listed = crate::query::messages(
+        MessagesCommand::List(list_args(dir.path())),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("messages list should format fixture timestamps");
+    let stats = crate::query::messages(
+        MessagesCommand::Stats(MessageFilterArgs {
+            db_dir: Some(dir.path().to_path_buf()),
+            conv: None,
+            since: None,
+            until: None,
+        }),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("messages stats should format fixture timestamps");
+    assert_eq!(data(listed)["items"][0]["send_time"], "2024-01-01T18:00:00");
+    assert_eq!(data(stats)["first_time"], "2024-01-01T18:00:00");
+
+    cli.tz = Some("UTC".to_owned());
+    let utc = crate::query::messages(
+        MessagesCommand::List(list_args(dir.path())),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("UTC message formatting should succeed");
+    assert_eq!(data(utc)["items"][0]["send_time"], "2024-01-01T10:00:00");
+
+    cli.tz = None;
+    config.tz = "Asia/Tokyo".to_owned();
+    let configured = crate::query::messages(
+        MessagesCommand::List(list_args(dir.path())),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("configured timezone should format timestamps");
+    assert_eq!(
+        data(configured)["items"][0]["send_time"],
+        "2024-01-01T19:00:00"
+    );
+
+    cli.tz = Some("UTC".to_owned());
+    let overridden = crate::query::messages(
+        MessagesCommand::List(list_args(dir.path())),
+        &cli,
+        &config,
+        &state,
+    )
+    .expect("CLI timezone should override configuration");
+    assert_eq!(
+        data(overridden)["items"][0]["send_time"],
+        "2024-01-01T10:00:00"
+    );
+}
+
+#[test]
 fn extra_config_fields_are_rejected_as_usage() {
     let error = serde_json::from_str::<Config>(r#"{"default_account":"","unexpected":true}"#)
         .expect_err("unknown config fields must be rejected");
     let usage = OwcError::usage(error.to_string());
     assert!(matches!(usage.code, ErrorCode::Usage));
+}
+
+#[test]
+fn recalled_content_is_extracted_from_json_and_xml_candidates() {
+    let json = crate::codec::decode_content(49, r#"{"revoker_id":"u9","revoked_at":1704103200}"#);
+    let recalled = json
+        .recalled
+        .expect("JSON recall fields should be extracted");
+    assert_eq!(recalled.revoker_id.as_deref(), Some("u9"));
+    assert_eq!(recalled.revoked_at.as_deref(), Some("1704103200"));
+
+    let xml = crate::codec::decode_content(
+        49,
+        "<revoker_id>u8</revoker_id><revoked_at>2024-01-01T10:00:00Z</revoked_at>",
+    );
+    let recalled = xml.recalled.expect("XML recall fields should be extracted");
+    assert_eq!(recalled.revoker_id.as_deref(), Some("u8"));
+    assert_eq!(recalled.revoked_at.as_deref(), Some("2024-01-01T10:00:00Z"));
 }
