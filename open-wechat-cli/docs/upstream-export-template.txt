@@ -1,0 +1,139 @@
+# Verbatim strings extracted from owc v0.1.0 release binary (win x86_64)
+# Source: owc-x86_64-pc-windows-msvc.exe, sha256 612febbd...2f19
+# These are the export HTML/Markdown template fragments. Reproduce faithfully.
+
+## ---- CSS + HTML skeleton (contiguous region) ----
+:root { color-scheme: light dark; --fg:#1f2328; --muted:#6a737d; --bg:#f6f7f9;
+        --card:#fff; --line:#e3e6ea; --accent:#2f6feb; --quote:#f3f5f8; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --muted:#9aa4af; --bg:#0f1115; --card:#171a1f;
+          --line:#272b31; --accent:#6ea8ff; --quote:#1d2128; }
+* { box-sizing: border-box; }
+body { margin:0; padding:32px 20px 80px; background:var(--bg); color:var(--fg);
+       font:15px/1.65 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+main { max-width: 900px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 6px; }
+.meta { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+.meta span { margin-right: 14px; white-space: nowrap; }
+.day { margin: 28px 0 10px; font-size: 13px; color: var(--muted); letter-spacing: .08em;
+       text-transform: uppercase; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.msg { display:flex; gap:12px; padding:10px 12px; border-radius:10px; background:var(--card);
+       border:1px solid var(--line); margin:10px 0; }
+.avatar { flex:0 0 34px; height:34px; border-radius:50%; background:var(--accent); color:#fff;
+          font-size:13px; display:flex; align-items:center; justify-content:center; }
+.body { min-width:0; flex:1; }
+.who { font-size:13px; color:var(--muted); margin-bottom:2px; }
+.who b { color:var(--fg); font-size:14px; }
+.chip { display:inline-block; font-size:11px; padding:1px 6px; border-radius:999px;
+        border:1px solid var(--line); color:var(--muted); margin-left:6px; vertical-align:1px; }
+.text { white-space:pre-wrap; word-break:break-word; }
+.ref { border-left:3px solid var(--line); padding:2px 0 2px 10px; margin:6px 0;
+       color:var(--muted); font-size:14px; white-space:pre-wrap; }
+figure { margin:10px 0 4px; }
+img { max-width:100%; border-radius:8px; border:1px solid var(--line); display:block; }
+figcaption, .cap { font-size:12px; color:var(--muted); margin-top:4px; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+.card { border:1px solid var(--line); border-radius:10px; padding:8px 10px; margin:8px 0;
+        background:var(--quote); }
+.card .t { font-weight:600; }
+.card .d { font-size:13px; color:var(--muted); }
+.file { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line);
+        border-radius:8px; padding:4px 8px; margin:6px 8px 0 0; font-size:13px; }
+.fwd { border-left:3px solid var(--accent); background:var(--quote); border-radius:0 10px 10px 0;
+       padding:8px 12px; margin:8px 0; }
+.fwd .h { font-weight:600; font-size:13px; margin-bottom:6px; }
+.fwd .item { padding:4px 0; border-top:1px dashed var(--line); }
+.fwd .item:first-of-type { border-top:none; }
+.fwd .fwd { background:transparent; border-left:2px dashed var(--line); margin:6px 0; padding:6px 10px; }
+.fwd .who2 { color:var(--muted); font-size:12px; }
+.muted { color:var(--muted); font-size:13px; }
+footer { max-width:900px; margin:36px auto 0; color:var(--muted); font-size:12px; }
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>
+</title>
+<style>
+#</style>
+</head>
+<body>
+<main>
+<h1>
+</h1>
+<div class="meta">
+</div>
+</main>
+<footer>
+ open-wechat-cli 
+ silk 
+</footer>
+</body>
+</html>
+![](
+
+## ---- fragment tags (order as found) ----
+>   
+KBMB
+- **
+<div class="text">
+</div>
+<div class="cap"><a href="
+</a></div>
+<div class=muted>
+</div>$<div class="item"><div class="who2">
+</div>
+</div>
+%<div class="fwd"><div class="h">
+</div>
+</div>
+src\render.rs
+%m-%d %H:%M
+silk 
+<div class="day">
+</div>
+<span class="chip">
+</span>
+<div class="muted">
+</div>
+%<div class="msg"><div class="avatar">
+,</div><div class="body"><div class="who"><b>
+</b>
+</div>
+</div></div>
+<span>
+</span>
+
+## ---- trailing fragments ----
+![](
+<sub>
+</sub>
+	<a href="
+</a>
+<div class="d">
+</div>
+!<div class="card"><div class="t">
+</div>
+</div>
+<div class="cap">
+</div>
+<div class="cap">
+ <a href="
+6</a>
+silk 
+</div>
+<div class="ref">
+ <b>
+</b>
+</div>
+ <div class="cap">
+</div>
+ <div class="cap">
+</div>
+rich_textchat_recorddoc_linkarticleminiprogramdrive_filedrive_noticearticle_cardapp_cardrich_cardapprovalstats_cardmoment_noticesystem
+key 
+ page1 
+.tmp
+WAL 
